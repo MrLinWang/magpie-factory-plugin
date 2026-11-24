@@ -49,15 +49,11 @@ function rebaseSchema(schema, rebase = true, legacy = false) {
   if (isObject(schema.dependencies)) for (const child of Object.values(schema.dependencies)) rebaseSchema(child, rebase, legacy)
 }
 
-function bodyString(body) {
-  return typeof body === "string" ? body
-    : body instanceof ArrayBuffer ? Buffer.from(body).toString("utf8")
-    : ArrayBuffer.isView(body) ? Buffer.from(body.buffer, body.byteOffset, body.byteLength).toString("utf8") : ""
-}
-
 export function wrapAnthropicTools(body) {
   const names = new Set()
-  const text = bodyString(body)
+  const text = typeof body === "string" ? body
+    : body instanceof ArrayBuffer ? Buffer.from(body).toString("utf8")
+    : ArrayBuffer.isView(body) ? Buffer.from(body.buffer, body.byteOffset, body.byteLength).toString("utf8") : ""
   let request
   try { request = parseToolJSON(text) } catch (e) {
     if (!(e instanceof SyntaxError)) throw e
@@ -83,167 +79,6 @@ export function wrapAnthropicTools(body) {
   return { body: JSON.stringify(request), names }
 }
 
-// Factory refuses a request that declares a tool under certain names
-// (client-phrases.json, toolNames). Such a tool is declared as <name>_tool
-// instead (then _tool_2, _tool_3 while that name is taken), in every field of
-// the request that carries tool names, and its calls in a reply get the
-// original name back. The aliases are chosen from the request alone, in the
-// order its tools are declared.
-const alias = "_tool"
-// Factory refuses some aliases too: Agent_tool is refused as well as
-// AgentTool, and since 2026-11-19 so are read_tool, bash_tool, edit_tool and
-// write_tool, while subagent and the _tool_2 names are answered (replayed).
-// Use a name Factory accepts when one is known.
-const PREFERRED_ALIASES = new Map([
-  ["Agent", "subagent"],
-  ["read", "read_tool_2"],
-  ["bash", "bash_tool_2"],
-  ["edit", "edit_tool_2"],
-  ["write", "write_tool_2"],
-  ["glob", "glob_tool"],
-  ["grep", "grep_tool"],
-  ["web_search", "web_search_tool"],
-  ["codex_app", "codex_app_tool"],
-])
-const list = (v) => Array.isArray(v) ? v : []
-
-// Per API, the objects whose `name` (key `k` of `o`, as [o, k]) is a declared
-// tool's, and those that name a declared tool in a choice, a call or a result.
-const nameSlots = {
-  anthropic(r) {
-    // a typed tool (bash_20250124) must keep its name
-    const declared = list(r.tools).filter((t) => isObject(t) && (t.type == null || t.type === "custom")).map((t) => [t, "name"])
-    const used = []
-    if (isObject(r.tool_choice) && r.tool_choice.type === "tool") used.push([r.tool_choice, "name"])
-    for (const m of list(r.messages)) {
-      if (m?.role !== "assistant") continue
-      for (const b of list(m.content)) if (b?.type === "tool_use") used.push([b, "name"])
-    }
-    return { declared, used }
-  },
-  chat(r) {
-    const declared = list(r.tools).filter((t) => isObject(t?.function)).map((t) => [t.function, "name"])
-    const used = []
-    if (isObject(r.tool_choice?.function)) used.push([r.tool_choice.function, "name"])
-    for (const m of list(r.messages)) {
-      if (m?.role !== "assistant") continue
-      for (const c of list(m.tool_calls)) if (isObject(c?.function)) used.push([c.function, "name"])
-    }
-    return { declared, used }
-  },
-  responses(r) {
-    // Codex's app tools are a namespace: Factory refuses the namespace's
-    // name, and a call names it in `namespace` beside the nested tool's
-    // `name`.
-    const declared = list(r.tools)
-      .filter((t) => isObject(t) && (t.type === "function" || t.type === "namespace"))
-      .map((t) => [t, "name"])
-    const used = []
-    if (isObject(r.tool_choice) && (r.tool_choice.type === "function" || r.tool_choice.type === "namespace")) used.push([r.tool_choice, "name"])
-    for (const item of list(r.input)) {
-      if (item?.type !== "function_call") continue
-      used.push([item, "name"])
-      if (typeof item.namespace === "string") used.push([item, "namespace"])
-    }
-    return { declared, used }
-  },
-  gemini(r) {
-    const declared = []
-    for (const t of list(r.tools)) for (const d of list(t?.functionDeclarations)) if (isObject(d)) declared.push([d, "name"])
-    const used = []
-    const allowed = r.toolConfig?.functionCallingConfig?.allowedFunctionNames
-    if (Array.isArray(allowed)) allowed.forEach((_, i) => used.push([allowed, i]))
-    for (const c of list(r.contents)) {
-      for (const p of list(c?.parts)) {
-        if (isObject(p?.functionCall)) used.push([p.functionCall, "name"])
-        if (isObject(p?.functionResponse)) used.push([p.functionResponse, "name"])
-      }
-    }
-    return { declared, used }
-  },
-}
-
-// aliasToolNames is body, a request of API `dialect` ("anthropic", "chat",
-// "responses" or "gemini"), with every tool it declares under a name of
-// `refused` (a Set) declared under its alias, and the aliases as a Map from
-// alias to original name. A request with nothing to alias comes back as it
-// is, the same body.
-export function aliasToolNames(dialect, body, refused) {
-  const none = { body, aliases: new Map() }
-  const slots = nameSlots[dialect]
-  const text = slots && bodyString(body)
-  if (!text) return none
-  let request
-  try { request = parseToolJSON(text) } catch { return none }
-  if (!isObject(request)) return none
-  const { declared, used } = slots(request)
-  const taken = new Set(declared.map(([o, k]) => o[k]))
-  const renamed = new Map()
-  for (const [o, k] of declared) {
-    const name = o[k]
-    if (!refused.has(name) || renamed.has(name)) continue
-    const stem = PREFERRED_ALIASES.get(name) ?? name + alias
-    let next = stem, n = 1
-    while (taken.has(next) || refused.has(next)) next = `${stem}_${++n}`
-    taken.add(next)
-    renamed.set(name, next)
-  }
-  if (!renamed.size) return none
-  for (const [o, k] of [...declared, ...used]) {
-    const next = renamed.get(o[k])
-    if (next !== undefined) o[k] = next
-  }
-  return { body: JSON.stringify(request), aliases: new Map([...renamed].map(([name, next]) => [next, name])) }
-}
-
-// the reply's side: each gives back the original name to the tool calls in
-// a reply (or one SSE event) of its API, and says whether it changed any
-const back = (o, aliases) => {
-  const name = aliases.get(o?.name)
-  if (name === undefined) return false
-  o.name = name
-  return true
-}
-const nameRestorers = {
-  anthropic(v, aliases) {
-    let changed = false
-    for (const b of [...list(v.content), v.content_block]) if (b?.type === "tool_use") changed = back(b, aliases) || changed
-    return changed
-  },
-  chat(v, aliases) {
-    let changed = false
-    for (const choice of list(v.choices)) {
-      for (const call of [...list(choice?.message?.tool_calls), ...list(choice?.delta?.tool_calls)]) changed = back(call?.function, aliases) || changed
-    }
-    return changed
-  },
-  responses(v, aliases) {
-    let changed = false
-    for (const item of [v.item, ...list(v.output), ...list(v.response?.output)]) {
-      if (item?.type !== "function_call") continue
-      changed = back(item, aliases) || changed
-      const namespace = aliases.get(item.namespace)
-      if (namespace !== undefined) {
-        item.namespace = namespace
-        changed = true
-      }
-    }
-    return changed
-  },
-  gemini(v, aliases) {
-    let changed = false
-    for (const candidate of list(v.candidates)) {
-      for (const part of list(candidate?.content?.parts)) changed = back(part?.functionCall, aliases) || changed
-    }
-    return changed
-  },
-}
-// a streamed Gemini reply without alt=sse is an array of such objects
-function restoreNames(dialect, value, aliases) {
-  if (Array.isArray(value)) return value.map((v) => restoreNames(dialect, v, aliases)).includes(true)
-  return isObject(value) && nameRestorers[dialect](value, aliases)
-}
-
 function unwrap(input, name) {
   if (!isObject(input) || !Object.hasOwn(input, argument) || Object.keys(input).length !== 1) throw new Error(`Factory: tool ${name} returned invalid wrapped arguments`)
   return input[argument]
@@ -256,12 +91,11 @@ function responseHeaders(res) {
   return { status: res.status, statusText: res.statusText, headers }
 }
 
-function toolStream(body, names, aliases, dialect) {
+function toolStream(body, names) {
   const reader = body.getReader()
   const decoder = new TextDecoder("utf-8", { fatal: true })
   const encoder = new TextEncoder()
   const blocks = new Map()
-  const marks = [...aliases.keys()]
   let pending = "", ended = false
   const incomplete = () => {
     if (blocks.size) throw new Error("Factory: incomplete wrapped tool arguments")
@@ -271,14 +105,7 @@ function toolStream(body, names, aliases, dialect) {
     const data = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).replace(/^ /, "")).join("\n")
     if (!data) return [raw + ending]
     if (data === "[DONE]") { incomplete(); return [raw + ending] }
-    // a reply that only has names to restore leaves alone every event that
-    // can't carry one
-    if (!names.size && !marks.some((mark) => data.includes(mark))) return [raw + ending]
-    let event
-    try { event = parseToolJSON(data) } catch (e) {
-      if (names.size || !(e instanceof SyntaxError)) throw e
-      return [raw + ending]
-    }
+    const event = parseToolJSON(data)
     const replace = (value) => {
       let first = true
       const next = []
@@ -292,7 +119,6 @@ function toolStream(body, names, aliases, dialect) {
       if (blocks.has(event.index)) throw new Error("Factory: duplicate wrapped tool block")
       blocks.set(event.index, { name: event.content_block.name, json: "", initial: event.content_block.input })
       event.content_block.input = {}
-      restoreNames(dialect, event, aliases)
       return [replace(event)]
     }
     const block = blocks.get(event.index)
@@ -309,7 +135,7 @@ function toolStream(body, names, aliases, dialect) {
     }
     if (event.type === "error") blocks.clear() // preserve the upstream error
     if (event.type === "message_stop") incomplete()
-    return [restoreNames(dialect, event, aliases) ? replace(event) : raw + ending]
+    return [raw + ending]
   }
   return new ReadableStream({
     async pull(controller) {
@@ -339,35 +165,17 @@ function toolStream(body, names, aliases, dialect) {
   })
 }
 
-async function reply(res, names, aliases, dialect) {
-  if ((!names.size && !aliases.size) || !res.ok || !res.body) return res
-  if ((res.headers.get("content-type") ?? "").includes("text/event-stream")) return new Response(toolStream(res.body, names, aliases, dialect), responseHeaders(res))
+export async function unwrapAnthropicTools(res, names) {
+  if (!names.size || !res.ok || !res.body) return res
+  if ((res.headers.get("content-type") ?? "").includes("text/event-stream")) return new Response(toolStream(res.body, names), responseHeaders(res))
   if (!(res.headers.get("content-type") ?? "").includes("json")) return res
   const text = await res.text()
-  let message
-  try { message = parseToolJSON(text) } catch (e) {
-    if (names.size || !(e instanceof SyntaxError)) throw e
-    return new Response(text, responseHeaders(res))
-  }
+  const message = parseToolJSON(text)
   let changed = false
   for (const block of Array.isArray(message?.content) ? message.content : []) {
     if (block?.type !== "tool_use" || !names.has(block.name)) continue
     block.input = unwrap(block.input, block.name)
     changed = true
   }
-  changed = restoreNames(dialect, message, aliases) || changed
   return new Response(changed ? JSON.stringify(message) : text, responseHeaders(res))
-}
-
-// unwrapAnthropicTools is res, a Messages reply, with the wrapped arguments
-// of the tools in names unwrapped and the aliases (alias to original name)
-// of aliasToolNames undone.
-export function unwrapAnthropicTools(res, names, aliases = new Map()) {
-  return reply(res, names, aliases, "anthropic")
-}
-
-// restoreToolNames is res, a reply of API `dialect` other than Messages (as
-// aliasToolNames takes them), with its aliases undone: JSON or SSE.
-export function restoreToolNames(res, dialect, aliases) {
-  return reply(res, new Set(), aliases, dialect)
 }

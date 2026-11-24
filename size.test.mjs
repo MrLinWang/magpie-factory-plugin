@@ -55,45 +55,30 @@ test("a 413 is asked once more with the older images left out, tool results kept
   expect(seen[1].headers.get("content-length")).toBeNull()
 })
 
-test("a 413 still there with the newest image kept is asked again with every image left out", async () => {
-  const { l, seen } = await loaded(1500)
-  const res = await l.fetch("https://api.factory.ai/api/llm/a/v1/messages", { method: "POST", body: JSON.stringify(session()) })
-  expect(res.status).toBe(200)
-  expect(seen.length).toBe(3)
-  const sent = JSON.parse(seen[2].body)
-  const want = session()
-  want.messages[0].content[1] = { type: "text", text: LEFT_OUT }
-  want.messages[2].content[0].content[0] = { type: "text", text: LEFT_OUT }
-  want.messages[4].content[0].content[1] = { type: "text", text: LEFT_OUT, cache_control: { type: "ephemeral" } }
-  expect(sent.messages).toEqual(want.messages)
-})
-
-test("a 413 still there with every image left out says it is Factory's byte limit, and what to do", async () => {
+test("a 413 still there with the older images left out says it is Factory's byte limit, and what to do", async () => {
   const { l, seen } = await loaded(100)
   const res = await l.fetch("https://api.factory.ai/api/llm/a/v1/messages", { method: "POST", body: JSON.stringify(session()) })
-  expect(seen.length).toBe(3)
+  expect(seen.length).toBe(2)
   expect(res.status).toBe(413)
   const e = await res.json()
   expect(e.type).toBe("error")
   expect(e.error.type).toBe("request_too_large")
   expect(e.error.message).toContain("(413: Request Entity Too Large)")
   expect(e.error.message).toContain("limits the size of a request's body in bytes")
-  expect(e.error.message).toContain("3 older images or files left out")
+  expect(e.error.message).toContain("2 older images or files left out")
   // magpie's gateway finds its own hint and doesn't add it again
   expect(e.error.message).toContain(TOO_LARGE_HINT)
   expect(e.error.message).not.toMatch(/context window|exceed/i)
 })
 
-test("a 413 with one image is asked again without it", async () => {
+test("a 413 with no older image to leave out is not asked again", async () => {
   const { l, seen } = await loaded(10)
   const res = await l.fetch("https://api.factory.ai/api/llm/o/v1/responses", { method: "POST", body: JSON.stringify({ model: "gpt-6-sol", input: [{ role: "user", content: [{ type: "input_text", text: "hi" }, { type: "input_image", image_url: "data:image/png;base64,AAAA" }] }] }) })
-  expect(seen.length).toBe(2)
+  expect(seen.length).toBe(1)
   expect(res.status).toBe(413)
-  const sent = JSON.parse(seen[1].body)
-  expect(sent.input[0].content[1]).toEqual({ type: "input_text", text: LEFT_OUT })
   const e = await res.json()
   expect(e.error.type).toBe("invalid_request_error")
-  expect(e.error.message).toContain("1 older image or file left out")
+  expect(e.error.message).not.toContain("left out")
   expect(e.error.message).toContain(TOO_LARGE_HINT)
 })
 

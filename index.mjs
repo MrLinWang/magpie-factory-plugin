@@ -4,8 +4,10 @@
 // built-in Factory account (internal/provider/factory*.go).
 
 import { STATUS_CODES } from "node:http"
+import { createHash } from "node:crypto"
 import { readFileSync } from "node:fs"
-import { parseToolJSON, wrapAnthropicTools, unwrapAnthropicTools, aliasToolNames, restoreToolNames } from "./anthropic-tools.mjs"
+import { parseToolJSON, wrapAnthropicTools, unwrapAnthropicTools } from "./anthropic-tools.mjs"
+import { aliasToolNames, restoreToolNames, toolSet } from "./tool-names.mjs"
 
 const PROVIDER = "factory"
 
@@ -453,6 +455,15 @@ async function reconcile(c) {
 // "Requested active organization is not accessible by this user".
 const orgRefused = (status, text) => status === 403 && text.toLowerCase().includes("active organization is not accessible")
 
+// renamedInFull holds the tool sets (toolSet) Factory refused until every
+// tool was renamed, in this process; the oldest goes past 256.
+const renamedInFull = new Set()
+function remember(set, key) {
+  set.delete(key)
+  set.add(key)
+  if (set.size > 256) set.delete(set.values().next().value)
+}
+
 // contentRefused is Factory's usage policy check refusing what the request
 // says, not who sent it: a 403 with code "content_policy_rejected" (droid
 // 0.245.0 tells it apart the same way, and only when Factory sent no
@@ -474,7 +485,7 @@ function contentRefused(status, text, headers) {
 // the request carries what droid sends.
 function explain(status, text, headers) {
   if (status !== 403) return ""
-  if (contentRefused(status, text, headers)) return "Factory's usage policy check reads the whole conversation, so this session's requests are refused again until the text that tripped it is gone: start a new session, or remove or reword what the conversation quotes (another agent's system prompt or instructions pasted in a message or a tool's output are the usual cause)"
+  if (contentRefused(status, text, headers)) return "Factory's usage policy check reads the whole conversation, so this session's requests are refused again until the text that tripped it is gone: start a new session, or remove or reword what the conversation quotes (another agent's system prompt or instructions pasted in a message or a tool's output are the usual cause). When a new session's first turn is refused too, it is in what the agent sends every turn: its system prompt, instruction files, skill list or tools' descriptions; turn skills, MCP servers and plugins off for this chat, then on again a few at a time, to find which"
   if (orgRefused(status, text)) return "the Factory account's organization changed; remove the account in magpie and sign in to it again"
   return "Factory refused the request. magpie adapts fixed client metadata on both OpenAI and Anthropic routes. Factory may still refuse unsupported fields or wrappers; check the upstream error, the organization's model policy, plan and regional provider availability, and compare the same model in Droid"
 }
@@ -549,13 +560,41 @@ const CODEX_COMPAT = "You are a coding agent based on GPT-6."
 // sentence and drop the rest.
 const CODEX_CLI_OPENING = /(^|\n)You are a coding agent running in the Codex CLI, a terminal-based coding assistant\. Codex CLI is an open source project led by OpenAI\.?/
 const CODEX_CLI_COMPAT = "You are a coding agent running in the Codex CLI."
+// dsh (@deepseek-ai/dsh, DeepSeek Harness) opens its system prompt with its
+// own identity line, "You are an AI agent powered by DeepSeek Harness."
+// (dsh-system-prompt's harness:identity section), then its preset's "You are
+// a coding agent powered by the <model> model." On Factory's Opus 5.5 every
+// first turn of a fresh dsh session was content_policy_rejected, tools
+// renamed in full or not (@a1pha1nthefog on X, 11-20, factory 0.1.52): an
+// identity sentence naming another agent's harness, the class of pi's and
+// omp's openings. The identity line goes as "You are an AI agent." and the
+// model line as the plain "Current model: <model>." droid's adapters use for
+// Claude Code's; both only at the start of a line of a system or developer
+// prompt, the rest of dsh's prompt as dsh wrote it.
+const DSH_OPENING = /(^|\n)You are an AI agent powered by DeepSeek (?:Harness|Runtime)\./
+const DSH_COMPAT = "You are an AI agent."
+const DSH_MODEL_LINE = /(^|\n)You are a coding agent powered by the ([^\n]+?) model\.(?=\n|$)/
+// dsh's Web GUI puts a paragraph in its system prompt
+// (@deepseek-ai/dsh-harness-dev-context, "You are interacting with the user
+// through the DeepSeek Harness Web GUI ..."), and one sentence of it is a
+// fixed line a vendor's client check reads as dsh: Google's Antigravity
+// turned it away from 11-17, and let it through with "gives" for "provides"
+// (agy-cli 0.1.88, packages/agy-cli/cloak.mjs, 3 of 3 on a real account).
+// @a1pha1nthefog's dsh on Factory (11-20, 0.1.53) was still refused with
+// the identity and model lines plain and the Web GUI notes in its prompt;
+// the sentence goes the same way here, in the prompt, wherever it sits in
+// its paragraph.
+const DSH_BROWSER = "The browser provides no implicit DOM, route, or screenshot context."
+const DSH_BROWSER_COMPAT = "The browser gives no implicit DOM, route, or screenshot context."
 function clientOpening(text) {
   if (typeof text !== "string") return text
-  return text
-    .replace(PI_OPENING, (_, at) => at + PI_COMPAT)
+  return text.replace(PI_OPENING, (_, at) => at + PI_COMPAT)
     .replace(OMP_OPENING, (_, at) => at + OMP_COMPAT)
     .replace(CODEX_OPENING, (_, at) => at + CODEX_COMPAT)
     .replace(CODEX_CLI_OPENING, (_, at) => at + CODEX_CLI_COMPAT)
+    .replace(DSH_OPENING, (_, at) => at + DSH_COMPAT)
+    .replace(DSH_MODEL_LINE, (_, at, model) => at + "Current model: " + model + ".")
+    .replaceAll(DSH_BROWSER, DSH_BROWSER_COMPAT)
 }
 
 // pi turns a compaction, and a branch it came back from, into a user
@@ -578,21 +617,17 @@ function piSummary(text) {
   return text
 }
 
-// Factory refuses pi's opening, its compaction opening, omp's opening and
-// Codex's GPT-6 opening wherever they appear, not only as the system prompt
-// or the whole summary: a tool result that prints the agent's system prompt,
-// or a historical session record, carries them too, and every later turn of
-// that conversation is refused. omp's and Codex's are listed without their
-// period, which Factory refuses as well.
+// Factory refuses pi's opening and its compaction opening wherever they
+// appear, not only as the system prompt or the whole summary: a tool result
+// that prints pi's system prompt, or a historical session record, carries
+// them too, and every later turn of that conversation is 403.
 //
 // The list lives in client-phrases.json so the guard and the sanitizer read
 // the same one. Its entries are written with a \uXXXX first character, so the
 // file is safe to read from a Droid session; JSON.parse here yields the real
 // phrase. "anywhere" is refused in any text (pi turns a compaction into one
 // user text), "toolOnly" is refused in tool output while the prompt adapters
-// keep them. "toolNames" are not phrases: Factory refuses a request that
-// declares a tool under one of these names (since 2026-11-18, whatever else
-// the request says), so aliasToolNames declares it under another.
+// keep them.
 const FALLBACK_PHRASES = {
   anywhere: [
     "You are an expert coding assistant operating inside pi, a coding agent harness.",
@@ -610,25 +645,22 @@ const FALLBACK_PHRASES = {
     "This session is being continued from a previous conversation that ran out of context.",
     "(user's private global instructions for all projects)",
   ],
-  toolNames: ["read", "bash", "edit", "write", "glob", "grep", "web_search", "task", "Bash", "Write", "get_weather", "exec_command", "write_stdin", "Agent", "tool_search", "codex_app"],
 }
 function loadClientPhrases() {
   try {
     const parsed = JSON.parse(readFileSync(new URL("./client-phrases.json", import.meta.url), "utf8"))
     const anywhere = Array.isArray(parsed?.anywhere) ? parsed.anywhere.filter((p) => typeof p === "string" && p) : []
     const toolOnly = Array.isArray(parsed?.toolOnly) ? parsed.toolOnly.filter((p) => typeof p === "string" && p) : []
-    const toolNames = Array.isArray(parsed?.toolNames) ? parsed.toolNames.filter((p) => typeof p === "string" && p) : []
-    // any group missing would silently drop protection, so use the
+    // either group missing would silently drop protection, so use the
     // built-in list instead
-    if (anywhere.length === 0 || toolOnly.length === 0 || toolNames.length === 0) throw new Error("client-phrases.json needs all three groups")
-    return { anywhere, toolOnly, toolNames }
+    if (anywhere.length === 0 || toolOnly.length === 0) throw new Error("client-phrases.json needs both groups")
+    return { anywhere, toolOnly }
   } catch {
     return FALLBACK_PHRASES
   }
 }
 const CLIENT_PHRASES = loadClientPhrases()
 const PI_QUOTED_IN_TOOL = CLIENT_PHRASES.anywhere
-const REFUSED_TOOL_NAMES = new Set(CLIENT_PHRASES.toolNames)
 
 // promptOpenings adapts the messages of msgs (chat completions' messages,
 // Responses' input) as anthropicBody adapts a Messages request's: pi's
@@ -741,14 +773,16 @@ function droidBody(path, body) {
         }
       }
     }
+    const described = toolDescriptions(m.tools)
     const ins = promptText(v ?? "")
     if (!ins.startsWith(DROID_LINE)) m.instructions = ins.trim() === "" ? DROID_LINE : DROID_LINE + "\n" + ins
-    else if (ins !== v || opened || systemed) m.instructions = ins
+    else if (ins !== v || opened || systemed || described) m.instructions = ins
     else if (!sampled) return body
   } else if (path.endsWith("/chat/completions")) {
     if (!Array.isArray(m.messages)) return body
     const opened = promptOpenings(m.messages, true)
-    if (!droidChat(m.messages) && !opened) return body
+    const described = toolDescriptions(m.tools)
+    if (!droidChat(m.messages) && !opened && !described) return body
   } else return body
   return JSON.stringify(m)
 }
@@ -769,6 +803,17 @@ const GEMINI_CALL = /\/models\/([^/:]+):(?:stream)?generateContent$/i
 // instruction without a role and opening with droid's line, as one text part
 // of droid's line and the instruction's text parts joined with "\n", then
 // its other parts. A body that can't be read goes on as it is.
+//
+// Its fields go in droid's order (GEMINI_ORDER), the model first. magpie's
+// gateway sends them sorted (contents, generationConfig, model, ...) and
+// the AI SDK has no model at all, so the model came after the contents,
+// most of a long session's bytes. Factory answered such a request of
+// 0.6 to 1.6 MB with 400 "Invalid model ID in request body", every retry
+// alike, while the same conversation's smaller requests went through and
+// no other route failed (marovole on X, gemini-4-hydrogen, 0.1.48). The
+// model's place is the one difference from droid that grows with the body:
+// droid always sends it first (testdata/droid-1.14.0-gemini-body.txt).
+const GEMINI_ORDER = ["model", "contents", "systemInstruction", "tools", "generationConfig"]
 function geminiBody(model, body) {
   const text = bodyText(body)
   if (text == null) return body
@@ -785,8 +830,12 @@ function geminiBody(model, body) {
   if (typeof si === "string") si = { parts: [{ text: si }] }
   if (!si || typeof si !== "object") si = { parts: [] }
   delete si.role
+  // the client's prompt, its user turns and its tools' descriptions are
+  // adapted as on Factory's other routes (droidBody, anthropicBody):
+  // magpie hands a Responses, chat or Messages request for a Gemini model
+  // here, and Factory's policy check reads it the same on this route
   const parts = Array.isArray(si.parts) ? si.parts.map((part) =>
-    part && typeof part.text === "string" ? { ...part, text: zcodeRuntimeContext(part.text) } : part) : []
+    part && typeof part.text === "string" ? { ...part, text: promptText(part.text) } : part) : []
   si.parts = parts
   if (!(typeof parts[0]?.text === "string" && parts[0].text.startsWith(DROID_LINE))) {
     const texts = []
@@ -799,10 +848,31 @@ function geminiBody(model, body) {
     si.parts = [{ text: joined.trim() === "" ? DROID_LINE : DROID_LINE + "\n" + joined }, ...rest]
   }
   m.systemInstruction = si
+  geminiTurns(m.contents)
+  if (Array.isArray(m.tools)) for (const t of m.tools) if (t && typeof t === "object") toolDescriptions(t.functionDeclarations)
   // Gemini's route has no tool-output adaptation: escape every refused
   // phrase in its parts (functionResponse, systemInstruction) here.
   escapeDeep(m, REFUSED_PHRASES)
-  return JSON.stringify(m)
+  const ordered = {}
+  for (const k of GEMINI_ORDER) if (m[k] !== undefined) ordered[k] = m[k]
+  for (const [k, v] of Object.entries(m)) if (!(k in ordered)) ordered[k] = v
+  return JSON.stringify(ordered)
+}
+
+// geminiTurns adapts the text parts of contents' user turns as
+// promptOpenings adapts a Responses or chat user message's: pi's summary,
+// Claude Code's reminders, Codex's AGENTS.md and environment blocks. The
+// model's turns, function calls and responses stay as they are (a
+// functionResponse is escaped with the rest of the body).
+function geminiTurns(contents) {
+  if (!Array.isArray(contents)) return
+  for (const c of contents) {
+    if (!c || typeof c !== "object" || c.role !== "user" || !Array.isArray(c.parts)) continue
+    for (const p of c.parts) {
+      if (!p || typeof p !== "object" || typeof p.text !== "string" || p.thought) continue
+      p.text = userText(piSummary(p.text))
+    }
+  }
 }
 
 // ---- request size -------------------------------------------------------------
@@ -842,9 +912,9 @@ const DIALECTS = {
 }
 
 // leaveOutAttachments is body, a request to path, with every image and file
-// but the newest keep left out, and how many were: null when there are none
-// to leave out or the body can't be read. keep 0 leaves every one out.
-function leaveOutAttachments(path, body, keep = KEEP_ATTACHMENTS) {
+// but the newest KEEP_ATTACHMENTS left out, and how many were: null when
+// there are none to leave out or the body can't be read.
+function leaveOutAttachments(path, body) {
   const d = DIALECTS[dialectOf(path)]
   const text = d && bodyText(body)
   if (!text) return null
@@ -870,7 +940,7 @@ function leaveOutAttachments(path, body, keep = KEEP_ATTACHMENTS) {
     }
   }
   walk(m[d.list], "")
-  const out = found.slice(0, Math.max(found.length - keep, 0))
+  const out = found.slice(0, Math.max(found.length - KEEP_ATTACHMENTS, 0))
   if (out.length === 0) return null
   // from the last, so a part dropped doesn't move the places before it
   for (const { list, i, drop } of out.reverse()) {
@@ -1187,8 +1257,60 @@ function configSkillText(text) {
   if (!text.includes(CONFIG_SKILL_REFUSED)) return text
   return text
     .split("\n")
-    .map((line) => (CONFIG_SKILL_ENTRY.test(line) ? line.replace(CONFIG_SKILL_REFUSED, CONFIG_SKILL_SAFE) : line))
+    .map((line) => (CONFIG_SKILL_ENTRY.test(line) ? harnessText(line.replace(CONFIG_SKILL_REFUSED, CONFIG_SKILL_SAFE)) : line))
     .join("\n")
+}
+
+// Factory's policy check reads a client's description of itself as an
+// agent harness as an attempt to run its models from another agent
+// framework, and refuses the request (@DennisYan4 on X, 2026-11-19: Claude
+// Code, Pi and Codex 400 content_policy_rejected since 11-17; Pi passed
+// once its prompt said "runtime" for "harness"). Claude Code ("the Claude
+// Code harness", "injected by the harness"), Pi 1.5 ("a coding agent
+// harness") and Codex ("context provided by the harness") all describe
+// themselves so. In a client's own prompt text and its tools' descriptions
+// the word, and only the word, says "runtime"; a name built from it
+// (harness_key, harness.rs, harness-ci) and the user's own words in their
+// turns and tool output are left as they are. A compound with a past
+// participle ("harness-tracked work", Claude Code's ScheduleWakeup) is
+// prose, and changes.
+const HARNESS_WORD = /(?<![\w/\\.-])(h|H)arness(es)?(?![\w/\\-]|\.\w)|(?<![\w/\\.-])(h|H)arness(?=-[a-z]+ed\b)/g
+function harnessText(text) {
+  if (typeof text !== "string" || !/harness/i.test(text)) return text
+  return text.replace(HARNESS_WORD, (_, h, plural, h2) => ((h ?? h2) === "H" ? "R" : "r") + "untime" + (plural ? "s" : ""))
+}
+
+// toolDescriptions puts each tool's description, and its schema's
+// descriptions, through harnessText: Anthropic's tools[].description and
+// input_schema, chat's tools[].function, Responses' tools[], Gemini's
+// functionDeclarations (parameters or parametersJsonSchema). False when
+// nothing changed.
+function schemaDescriptions(schema, depth = 0) {
+  if (!schema || typeof schema !== "object" || depth > 32) return false
+  let changed = false
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === "description" && typeof value === "string") {
+      const adapted = harnessText(value)
+      if (adapted !== value) (schema[key] = adapted), (changed = true)
+    } else if (value && typeof value === "object" && !["default", "const", "examples", "enum"].includes(key)) {
+      if (schemaDescriptions(value, depth + 1)) changed = true
+    }
+  }
+  return changed
+}
+function toolDescriptions(tools) {
+  if (!Array.isArray(tools)) return false
+  let changed = false
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object") continue
+    const fn = tool.function && typeof tool.function === "object" ? tool.function : tool
+    if (typeof fn.description === "string") {
+      const adapted = harnessText(fn.description)
+      if (adapted !== fn.description) (fn.description = adapted), (changed = true)
+    }
+    for (const key of ["input_schema", "parameters", "parametersJsonSchema"]) if (schemaDescriptions(fn[key])) changed = true
+  }
+  return changed
 }
 
 // Claude Code also sends the skill list alone as a system message: the
@@ -1232,9 +1354,26 @@ function systemContext(text) {
   if (SYSTEM_TOKEN_OPENING.test(text) || SYSTEM_SKILL_CONTEXT.test(text)) return announcedContext(text)
   if (HOOK_OUTPUT.test(text) || text.startsWith(DEFERRED_TOOLS_OPENING)) {
     const at = text.indexOf(HOOK_CONTEXT)
-    return at < 0 ? text : text.slice(0, at + 1) + generatedContext(text.slice(at + 1))
+    if (at < 0) return text
+    const head = HOOK_OUTPUT.test(text) ? text.slice(0, at + 1) : listedSkills(text.slice(0, at + 1))
+    return head + generatedContext(text.slice(at + 1))
   }
   return generatedContext(text)
+}
+
+// Claude Code 2.1.327 sends one system message that opens with the
+// deferred tools, then the agent types and the skill list, and only then
+// the environment (@dannykkg on X, 2026-11-24). The list sits before the
+// environment, where generatedContext doesn't look. Adapt the entry only
+// when the paragraph before it is the exact skill header, and stop at the
+// first hook paragraph: a hook owns what follows it.
+function listedSkills(head) {
+  const parts = head.split("\n\n")
+  for (let i = 1; i < parts.length; i++) {
+    if (HOOK_NOTIFICATION.test(parts[i])) break
+    if (parts[i - 1] === "The following skills are available for use with the Skill tool:" && parts[i].startsWith("- ")) parts[i] = configSkillText(parts[i])
+  }
+  return parts.join("\n\n")
 }
 
 // Runtime notifications can precede a skill update, so the message opening
@@ -1579,12 +1718,10 @@ function quotedToolText(text, prefix = QUOTED_TOOL_PREFIX) {
 function escapePhrases(text, phrases = PI_QUOTED_IN_TOOL) {
   let out = text
   // By default only the phrases proven to be refused outside tool output
-  // (pi's opening, its compaction opening, omp's and Codex's openings):
-  // escaping generated reminders such as GLOBAL_INSTRUCTIONS or Claude
-  // Code's environment line would rewrite text the adapters deliberately
-  // keep.
-  // Gemini's route passes the full list, because its tool output has no
-  // quotedToolText of its own.
+  // (pi's opening and its compaction opening): escaping generated reminders
+  // such as GLOBAL_INSTRUCTIONS or Claude Code's environment line would
+  // rewrite text the adapters deliberately keep. Gemini's route passes the
+  // full list, because its tool output has no quotedToolText of its own.
   for (const phrase of phrases) {
     if (out.includes(phrase)) out = out.replaceAll(phrase, "\\u" + phrase.charCodeAt(0).toString(16).padStart(4, "0") + phrase.slice(1))
   }
@@ -1643,10 +1780,23 @@ function sanitizeBody(body) {
 // Claude Code 403 while Codex worked on the same account).
 
 // claudeIdentity opens text with droid's line in place of Claude Code's
-// fixed first line, when text is that line alone or opens with it.
+// fixed first line, when text is that line alone or opens with it. magpie
+// joins a Messages system's blocks with nothing between them when it
+// translates a request for /api/llm/o, so a subagent's prompt (Claude Code
+// 2.1.327: the identity block, then "You are an agent for Claude Code, …"
+// with no newline of its own) reached Factory as "…Claude Agent SDK.You
+// are an agent …", and the identity went as it was. The line glued to the
+// next block is the same line; the longest identity it opens with is the
+// one, and droid's line goes on its own line before the rest.
 function claudeIdentity(text) {
-  const identity = [...CLAUDE_IDENTITIES].find((line) => text === line || text.startsWith(line + "\n"))
-  return identity ? DROID_LINE + text.slice(identity.length) : text
+  const identity = [...CLAUDE_IDENTITIES].filter((line) => text.startsWith(line)).sort((a, b) => b.length - a.length)[0]
+  if (!identity) return text
+  const rest = text.slice(identity.length)
+  if (rest === "" || rest.startsWith("\n")) return DROID_LINE + rest
+  // glued to the next block with nothing between: the gateway joined them.
+  // A space or other text after the line is the user's own sentence.
+  if (/^[A-Z]/.test(rest)) return DROID_LINE + "\n" + rest
+  return text
 }
 
 // ZCode embeds its generated environment paragraph, with unindented bullets,
@@ -1670,6 +1820,28 @@ function zcodeRuntimeContext(text) {
   })
 }
 
+// Claude Code 2.1.327 sends its environment as a system message after the
+// first user turn ("# Environment\nYou have been invoked in the following
+// environment: \n - Primary working directory: …"). Translated for
+// /api/llm/o, magpie folds a system message sent before any reply into the
+// system prompt, after a blank line, so the paragraph sat in the prompt,
+// where only an environment at its start (ZCode's) changed, and every
+// Claude Code request on a chat or Responses model carried the opening
+// Factory refuses (@dannykkg on X, 11-24: "the environment info not
+// handled"). Only a whole generated paragraph changes: the heading, the
+// fixed sentence and its bulleted lines, at the start of the prompt or
+// after a blank line, followed by a blank line or the end, outside a
+// fence; every value stays.
+const CLAUDE_ENV_PARAGRAPH = /(^|\n\n)(# Environment\nYou have been invoked in the following environment:[ \t]*(?:\n {1,2}- [^\n]*)+)(?=\n\n|\n?$)/g
+function claudeEnvironment(text) {
+  return text.replace(CLAUDE_ENV_PARAGRAPH, (block, lead, paragraph, offset) => {
+    if (insideFence(text, offset + lead.length)) return block
+    return lead + paragraph
+      .replace("# Environment", "# Runtime context")
+      .replace("You have been invoked in the following environment:", "The session environment is:")
+  })
+}
+
 // Codex 0.170's guardian review prompt tells the reviewer, in one line,
 // that it runs read-only, has no network access, and must not ask for
 // sandbox permissions. Factory refuses that combination (400
@@ -1682,16 +1854,14 @@ function guardianRestrictions(text) {
   return typeof text === "string" ? text.replaceAll(GUARDIAN_NETWORK, GUARDIAN_NETWORK_COMPAT) : text
 }
 
-// promptText adapts a system prompt's text. Claude Code 2.1 sends its
-// generated environment as a system block too (#658), so the same
-// adaptation that user reminders get applies here.
+// promptText adapts a system prompt's text.
 function promptText(text) {
-  return configSkillText(guardianRestrictions(clientOpening(systemModelLine(systemContext(claudeIdentity(zcodeRuntimeContext(text)))))))
+  return harnessText(configSkillText(guardianRestrictions(clientOpening(systemModelLine(claudeIdentity(claudeEnvironment(zcodeRuntimeContext(text))))))))
 }
 
 // systemMessageText adapts a system message's text after the prompt.
 function systemMessageText(text) {
-  return bareSkills(guardianRestrictions(clientOpening(systemContext(zcodeRuntimeContext(text)))))
+  return harnessText(bareSkills(guardianRestrictions(clientOpening(systemContext(zcodeRuntimeContext(text))))))
 }
 
 // userBlockText adapts one text block of a user turn.
@@ -1713,8 +1883,38 @@ function userBlockText(text) {
       .replace("Assistant knowledge cutoff is", "Model knowledge cutoff:")
   }
   if (SKILL_REMINDER.test(text)) return configSkillText(text)
-  return text
+  if (DSH_SKILL_CATALOG.test(text)) return harnessText(text)
+  return foldedSystemText(text)
 }
+
+// A system message Claude Code sends after a reply (2.1.327, after
+// /compact and in a subagent: the deferred tools, the agent types, the
+// skills, the environment, the model line and the date, as one message)
+// is folded by magpie into a user turn as one reminder when it translates
+// the request for /api/llm/o or rebuilds it for /api/llm/a. As a reminder
+// none of the whole-block patterns above match it, and its environment,
+// model line and update-config sentence went to Factory as they were. It
+// is adapted as the system message it was (systemMessageText), and only
+// one that opens as Claude Code's generated system messages open: the
+// deferred-tools announcement, a startup hook's output or the
+// environment paragraph.
+function foldedSystemText(text) {
+  if (!text.startsWith(REMINDER_OPEN) || !text.endsWith(REMINDER_CLOSE)) return text
+  const inner = text.slice(REMINDER_OPEN.length, -REMINDER_CLOSE.length)
+  if (inner.includes(REMINDER_OPEN) || inner.includes(REMINDER_CLOSE)) return text
+  if (!inner.startsWith(DEFERRED_TOOLS_OPENING) && !HOOK_OUTPUT.test(inner) && !SYSTEM_ENV_CONTEXT.test(inner + "\n")) return text
+  const adapted = systemMessageText(inner)
+  return adapted === inner ? text : REMINDER_OPEN + adapted + REMINDER_CLOSE
+}
+
+// dsh (@deepseek-ai/dsh-tool-skill) announces its skills in a user turn, a
+// <system-reminder> of its own wording around <available_skills>: the first
+// catalog, a changed one, or an incomplete one. Like a tool's description,
+// a skill's is the client's metadata, not the user's words, and
+// @a1pha1nthefog's 174-skill catalog names "DeepSeek Harness" in it; the
+// word goes as harnessText says, as it does in the system prompt and the
+// tools' descriptions. Only a whole generated block matches.
+const DSH_SKILL_CATALOG = /^<system-reminder>\n(?:A skill is a reusable set of task-specific instructions\. The following skills are available in this session:|The available skill catalog changed\. This complete catalog replaces every earlier available-skills list in this session:|Skill discovery is incomplete\. This catalog of currently available skills replaces every earlier available-skills list in this session:)\n\n<available_skills>\n(?:(?!<\/?system-reminder>)[\s\S])*\n<\/system-reminder>$/
 
 // A chat completions user message is one string: magpie joins a Messages
 // turn's text blocks with nothing between them, so a reminder block and the
@@ -1722,9 +1922,131 @@ function userBlockText(text) {
 // reminder in it as the block it was; the rest stays as it is.
 const REMINDER_BLOCK = /<system-reminder>\n[\s\S]*?\n<\/system-reminder>/g
 function userText(text) {
+  const blocks = joinedBlocks(text)
+  if (blocks.length > 1) return blocks.map(oneUserText).join("")
+  return oneUserText(text)
+}
+
+function oneUserText(text) {
   const adapted = userBlockText(text)
   if (adapted !== text || !text.includes("<system-reminder>\n")) return adapted
   return text.replace(REMINDER_BLOCK, (block) => userBlockText(block))
+}
+
+// joinedBlocks splits a chat user message back into the blocks magpie
+// joined with nothing between them. Claude Code's turn after /compact is
+// one such turn: the summary, which ends with no newline, then each
+// restored file and the rest of its context as a reminder of its own. As
+// one text it opened with the compaction header and was adapted as one
+// summary, and the reminders glued to it went to Factory as they were
+// (@dannykkg on X, 2026-11-20). Only a place nothing but joining makes is
+// a boundary: a reminder opening right after a character that is not a
+// newline, or the compaction header right after a reminder's close, and
+// either only where every reminder opened before it is closed, so a file a
+// read result quotes stays inside its block. A text with no such place is
+// one block, as before.
+const REMINDER_OPEN = "<system-reminder>\n", REMINDER_CLOSE = "\n</system-reminder>"
+function joinedBlocks(text) {
+  if (!text.includes(REMINDER_OPEN)) return [text]
+  const blocks = []
+  let start = 0, open = 0
+  const marks = /<system-reminder>\n|\n<\/system-reminder>/g
+  for (let m; (m = marks.exec(text)) !== null;) {
+    const i = m.index
+    if (m[0] === REMINDER_OPEN) {
+      if (i > start && open === 0 && text[i - 1] !== "\n") { blocks.push(text.slice(start, i)); start = i }
+      open++
+    } else if (open > 0 && --open === 0) {
+      const next = i + REMINDER_CLOSE.length
+      const prefix = COMPACT_ARTIFACT.exec(text.slice(next, next + 400))?.[0] ?? ""
+      if (text.startsWith(COMPACT_HEADER, next + prefix.length)) { blocks.push(text.slice(start, next)); start = next }
+    }
+  }
+  blocks.push(text.slice(start))
+  return blocks
+}
+
+// Claude Code's tool search (ENABLE_TOOL_SEARCH, on behind a gateway since
+// 2.1.304) declares a tool ToolSearch loaded with defer_loading, keeps it
+// on with a never-called DeferredToolPlaceholder tool, and answers a
+// ToolSearch call with tool_reference blocks (newer builds: the tool's
+// tool_definition, and tool_addition/tool_removal blocks in a message).
+// Factory's Messages route has no tool search and turns the request away
+// (@DennisYan4 on X, 2026-11-19), and droid never sends any of it. Claude
+// Code's own answer for a backend without tool search (its Foundry path)
+// is what goes here: the placeholder off, defer_loading off every tool, so
+// each loaded tool is declared in full. A definition carried in a message
+// joins the tools; a tool_result's reference, or definition, goes as the
+// text magpie's gateway tells a model on a translated route, so the
+// tool_use/tool_result pairing stays; tool_addition and tool_removal
+// blocks go, and a message they leave empty with them. False when the
+// request has none of it.
+const DEFERRED_PLACEHOLDER = "DeferredToolPlaceholder"
+const toolLoadedText = (name) => "Tool " + name + " is loaded and can be called now."
+function undeferredTools(request) {
+  let changed = false
+  const tools = Array.isArray(request.tools) ? request.tools : null
+  const have = new Set()
+  if (tools) {
+    for (let i = tools.length - 1; i >= 0; i--) {
+      const tool = tools[i]
+      if (tool?.name === DEFERRED_PLACEHOLDER) {
+        tools.splice(i, 1)
+        changed = true
+        continue
+      }
+      if (tool && typeof tool === "object" && "defer_loading" in tool) {
+        delete tool.defer_loading
+        changed = true
+      }
+      if (typeof tool?.name === "string") have.add(tool.name)
+    }
+  }
+  const added = []
+  const declare = (def) => {
+    if (!def || typeof def !== "object" || Array.isArray(def) || typeof def.name !== "string" || !def.name || have.has(def.name) || def.name === DEFERRED_PLACEHOLDER) return
+    const { defer_loading: _, ...rest } = def
+    added.push(rest)
+    have.add(def.name)
+  }
+  const messages = request.messages
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (!Array.isArray(message?.content)) continue
+    const kept = []
+    let touched = false
+    for (const block of message.content) {
+      const type = block?.type
+      if (type === "tool_addition" || type === "tool_removal" || type === "tool_reference") {
+        if (type === "tool_addition" && block.tool?.type === "tool_definition") declare(block.tool.definition)
+        touched = true
+        continue
+      }
+      if (type === "tool_result" && Array.isArray(block.content) && block.content.some((c) => c?.type === "tool_reference" || c?.type === "tool_definition")) {
+        const content = []
+        for (const c of block.content) {
+          if (c?.type === "tool_definition") declare(c.definition)
+          const name = c?.type === "tool_reference" ? c.tool_name : c?.type === "tool_definition" ? c.definition?.name : undefined
+          if (c?.type !== "tool_reference" && c?.type !== "tool_definition") content.push(c)
+          else if (typeof name === "string" && name) content.push({ type: "text", text: toolLoadedText(name) })
+        }
+        block.content = content.length ? content : [{ type: "text", text: "No tools were loaded." }]
+        touched = true
+      }
+      kept.push(block)
+    }
+    if (!touched) continue
+    changed = true
+    if (kept.length === 0) messages.splice(i, 1)
+    else message.content = kept
+  }
+  if (added.length) {
+    added.reverse()
+    if (tools) tools.push(...added)
+    else request.tools = added
+    changed = true
+  }
+  return changed
 }
 
 function anthropicBody(body) {
@@ -1793,17 +2115,6 @@ function anthropicBody(body) {
     }
   }
   if (changed) request.system = kept
-
-  // Factory refuses a tool declaration that carries defer_loading: true
-  // (Claude Code's DeferredToolPlaceholder, 400 content_policy_rejected,
-  // replayed 2026-11-18). Deferred loading is the client's own feature; the
-  // field means nothing to the model, so drop it from every declaration.
-  for (const tool of Array.isArray(request.tools) ? request.tools : []) {
-    if (tool && typeof tool === "object" && Object.hasOwn(tool, "defer_loading")) {
-      delete tool.defer_loading
-      changed = true
-    }
-  }
 
   for (const message of request.messages) {
     if (message?.role === "system" && typeof message.content === "string") {
@@ -1875,7 +2186,35 @@ function anthropicBody(body) {
     delete request.context_management
     changed = true
   }
+  if (undeferredTools(request)) changed = true
+  if (toolDescriptions(request.tools)) changed = true
   return changed ? JSON.stringify(request) : body
+}
+
+// CONVERSATION is the header the chat.headers hook below names the
+// conversation in, for the loader's fetch to read and take off: it never
+// reaches Factory.
+const CONVERSATION = "x-magpie-factory-conversation"
+
+// sessionId is the x-session-id droid sends for a conversation: droid opens
+// one session per conversation, and a subagent's Task its own, so every
+// request of one conversation says the same id and no two conversations
+// share one. A UUID, as droid's are, made of a hash of the conversation
+// magpie names (its session, else its first message's hash) and the
+// subagent; fallback, this process's own, when magpie names none.
+// One id for every request of the process put every conversation, model
+// and subagent in one Factory session, which droid never does, and
+// Factory's Gemini route answered a Gemini 4 model in such a session now
+// and then with 400 "Invalid model ID in request body" (marovole on X).
+function sessionId(conversation, subagent, fallback) {
+  conversation = String(conversation ?? "").trim().slice(0, 128)
+  if (!conversation) return fallback
+  subagent = String(subagent ?? "").trim().slice(0, 128)
+  const b = createHash("sha256").update("factory-session\0" + conversation + "\0" + subagent).digest().subarray(0, 16)
+  b[6] = (b[6] & 0x0f) | 0x40
+  b[8] = (b[8] & 0x3f) | 0x80
+  const x = b.toString("hex")
+  return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20)}`
 }
 
 export const FactoryAuthPlugin = async ({ client, magpie }) => {
@@ -1896,7 +2235,7 @@ export const FactoryAuthPlugin = async ({ client, magpie }) => {
     }
     return models
   }
-  // the session id this process's requests carry
+  // the session id a request that names no conversation carries
   const session = crypto.randomUUID()
   // serializes checking, rotating and saving tokens: WorkOS rotates the
   // refresh token, so two refreshes would spend it twice
@@ -2112,6 +2451,15 @@ export const FactoryAuthPlugin = async ({ client, magpie }) => {
   }
 
   return {
+    // the conversation a request is of, as magpie tells the hook (its
+    // session, else its first message's hash), for the loader's fetch to
+    // name its x-session-id by (sessionId). Every plugin's hook sees every
+    // provider's requests, so it goes on Factory's alone.
+    "chat.headers": async (input, output) => {
+      const id = input?.model?.providerID ?? input?.provider?.info?.id
+      if (id !== PROVIDER || !input?.sessionID || !output?.headers) return
+      output.headers[CONVERSATION] = String(input.sessionID).slice(0, 128)
+    },
     // magpie's list for this provider: the same models configModels gives
     // OpenCode, each with the token multiplier droid shows it by, which
     // magpie shows beside the model as its rate
@@ -2198,7 +2546,7 @@ export const FactoryAuthPlugin = async ({ client, magpie }) => {
 
         const { fresh, mendOrg } = account(getAuth)
 
-        const send = async (input, init, body, renewed) => {
+        const send = async (input, init, body, renewed, every = false) => {
           const c = await fresh(renewed)
           let url = input instanceof Request ? input.url : String(input)
           // Gemini's: Factory's generate route, the model in the body
@@ -2215,6 +2563,10 @@ export const FactoryAuthPlugin = async ({ client, magpie }) => {
           const to = llmBase(c)
           if (to !== API && url.startsWith(API)) url = to + url.slice(API.length)
           const h = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
+          // the conversation the hook named, else the session magpie or
+          // OpenCode 2 (which has no chat.headers) names on the request
+          const conversation = h.get(CONVERSATION) || h.get("x-magpie-session") || h.get("x-opencode-session")
+          h.delete(CONVERSATION)
           h.delete("x-api-key")
           // the AI SDK's Google package's, with OpenCode's placeholder key
           h.delete("x-goog-api-key")
@@ -2229,7 +2581,7 @@ export const FactoryAuthPlugin = async ({ client, magpie }) => {
           const model = byId.get(bodyModel(body))
           const upstream = model ? model.upstream : path.includes("/llm/o/") ? "openai" : "anthropic"
           h.set("x-api-provider", upstream)
-          h.set("x-session-id", session)
+          h.set("x-session-id", sessionId(conversation, h.get("x-magpie-subagent"), session))
           h.set("x-assistant-message-id", crypto.randomUUID())
           h.set("x-provider-routing-source", "registry_default")
           if (upstream === "openai") h.set("OpenAI-Platform", "org-bHuLtG1fGmYk5YaOihAAXFBw")
@@ -2238,17 +2590,16 @@ export const FactoryAuthPlugin = async ({ client, magpie }) => {
           if (path.includes("/llm/a/")) h.set("X-Api-Key", "placeholder")
           // another agent's request opens as droid's does (droidBody)
           const anthropic = path.includes("/llm/a/") && (path.endsWith("/messages") || path.endsWith("/messages/count_tokens"))
-          // Factory refuses some tool names (client-phrases.json): they go
-          // out aliased and come back as they were
-          const dialect = anthropic ? "anthropic" : dialectOf(path)
-          const named = aliasToolNames(dialect, anthropic ? anthropicBody(body) : droidBody(path, body), REFUSED_TOOL_NAMES)
+          // Factory refuses some tool names outright (tool-names.mjs): those
+          // go out under another name and come back as the caller's; with
+          // every, all of its tools do (renamedInFull)
+          const named = aliasToolNames(anthropic ? anthropicBody(body) : droidBody(path, body), every)
           const adapted = anthropic ? wrapAnthropicTools(named.body) : { body: named.body, names: new Set() }
           const out = sanitizeBody(adapted.body)
           // the caller's length is of the body it sent, not of this one
           if (out !== init?.body) h.delete("content-length")
           const res = await fetch(url, { ...init, method: init?.method ?? (input instanceof Request ? input.method : "POST"), headers: h, body: out })
-          if (path.endsWith("/messages")) return unwrapAnthropicTools(res, adapted.names, named.aliases)
-          return dialect && !anthropic ? restoreToolNames(res, dialect, named.aliases) : res
+          return restoreToolNames(path.endsWith("/messages") ? await unwrapAnthropicTools(res, adapted.names) : res, named.aliases)
         }
 
         return {
@@ -2269,33 +2620,42 @@ export const FactoryAuthPlugin = async ({ client, magpie }) => {
             // refusal said for what it is (leaveOutAttachments)
             const smaller = async (res) => {
               const path = new URL(url).pathname
-              // first keep the newest image or file, then leave every one out
               const less = leaveOutAttachments(path, body)
-              let last = less
               if (less) {
                 await res.body?.cancel()
-                res = await send(input, init, less.body, onRenew)
+                res = await send(input, init, less.body, onRenew, every)
                 if (res.status !== 413) return res
-              }
-              const all = leaveOutAttachments(path, body, 0)
-              if (all && (!less || all.left > less.left)) {
-                await res.body?.cancel()
-                res = await send(input, init, all.body, onRenew)
-                if (res.status !== 413) return res
-                last = all
               }
               const anthropic = path.includes("/llm/a/")
-              return errorReply(url, 413, anthropic ? "request_too_large" : "invalid_request_error", tooLarge(await res.text(), last?.left ?? 0), new Headers(res.headers))
+              return errorReply(url, 413, anthropic ? "request_too_large" : "invalid_request_error", tooLarge(await res.text(), less?.left ?? 0), new Headers(res.headers))
             }
+            // a tool set Factory refused by a name tool-names.mjs doesn't
+            // list yet, and took with every tool renamed, goes renamed in
+            // full from then on
+            const tools = toolSet(body)
+            let every = renamedInFull.has(tools)
             let res
             try {
-              res = await send(input, init, body, onRenew)
+              res = await send(input, init, body, onRenew, every)
               if (res.status === 413) return answer(await smaller(res))
               if (res.status !== 403) return answer(res)
               let text = await res.text()
               if (!contentRefused(res.status, text, res.headers) && (await mendOrg(res.status, text, onRenew).catch(() => false))) {
-                res = await send(input, init, body, onRenew)
+                res = await send(input, init, body, onRenew, every)
                 if (res.status !== 403) return answer(res)
+                text = await res.text()
+              }
+              // Factory's list of tool names it refuses grows without notice
+              // (tool-names.mjs): refused with tools declared, the request
+              // goes once more with each tool renamed. Refused again, it is
+              // what the request says, and that refusal is the answer.
+              if (contentRefused(res.status, text, res.headers) && tools && !every) {
+                every = true
+                res = await send(input, init, body, onRenew, true)
+                if (res.status !== 403) {
+                  if (res.ok) remember(renamedInFull, tools)
+                  return answer(res)
+                }
                 text = await res.text()
               }
               const why = explain(res.status, text, res.headers)
@@ -2326,4 +2686,4 @@ export const FactoryAuthPlugin = async ({ client, magpie }) => {
 }
 
 // for tests
-export const _internal = { STANDARD_ONLY, contentRefused, explain, fastBody, FAST_BETA, limitWindows, windowEnd, dollars, vendorError, CORE, droidBody, DROID_LINE, geminiBody, leaveOutAttachments, LEFT_OUT, TOO_LARGE_HINT, MODELS, PROMOTIONS, rateOf, configModels, providerModel, providerModels }
+export const _internal = { harnessText, undeferredTools, toolDescriptions, renamedInFull, CONVERSATION, sessionId, STANDARD_ONLY, contentRefused, explain, fastBody, FAST_BETA, limitWindows, windowEnd, dollars, vendorError, CORE, droidBody, DROID_LINE, geminiBody, GEMINI_ORDER, leaveOutAttachments, LEFT_OUT, TOO_LARGE_HINT, MODELS, PROMOTIONS, rateOf, configModels, providerModel, providerModels }

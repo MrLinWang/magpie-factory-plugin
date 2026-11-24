@@ -3,8 +3,8 @@
 // refused part: the sentence Codex opens its system prompt with, alone and
 // without its period too; Codex's other opening ("You are a coding agent
 // running in the Codex CLI…") and the sentence reworded as below passed.
-// Codex's exec_command and write_stdin tool names are refused too; they are
-// covered in tool-names.test.mjs.
+// Tool-name compatibility, including names Factory no longer refuses but the
+// plugin still renames conservatively, is covered in tool-names.test.mjs.
 import { afterEach, expect, test } from "bun:test"
 import { FactoryAuthPlugin, _internal } from "./index.mjs"
 

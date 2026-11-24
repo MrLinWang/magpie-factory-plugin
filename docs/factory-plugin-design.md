@@ -1,7 +1,7 @@
 # Factory 插件详细设计
 
-> 适用版本：`factory/package.json` 0.1.49  
-> 代码基线：提交 `1e8577eea0`  
+> 适用版本：`factory/package.json` 0.1.58
+> 代码基线：官方 factory 0.1.57（upstream 提交 `261cdc0b0964`），叠加本地 Codex/omp/guardian 兼容修复
 > 面向读者：插件维护者、magpie/OpenCode 集成开发者  
 > 使用说明：见 [`../factory/README.md`](../factory/README.md)。本文描述内部结构、请求管线与设计取舍。
 
@@ -78,10 +78,10 @@ flowchart LR
 | `droidBody()` | OpenAI 形状的系统提示、工具输出和 Fast Mode 适配 |
 | `anthropicBody()` | Anthropic Messages 的固定元数据适配 |
 | `geminiBody()` | Gemini 的 systemInstruction、模型字段和短语转义 |
-| `aliasToolNames()` | 被拒工具名的确定性别名，以及回复侧还原 |
+| `aliasToolNames()` | 被拒工具名映射到 Droid 名称或进程内稳定后缀，以及回复侧还原 |
 | `wrapAnthropicTools()` | 根级 `anyOf/oneOf/allOf` schema 的 `arguments` 包装 |
 | `sanitizeBody()` | 离开插件前的最后一遍全文短语转义 |
-| `client-phrases.json` | 固定短语和工具名的单一来源 |
+| `client-phrases.json` | 固定文本短语的来源；`tool-names.mjs` 独立维护工具名规则 |
 
 ## 5. 入口与宿主适配
 
@@ -92,8 +92,9 @@ flowchart LR
 | `factory/index.mjs` | 主实现；导出 `FactoryAuthPlugin` 和测试用的 `_internal` |
 | `factory/opencode.mjs` | OpenCode 1.x / magpie 的入口，只 re-export `FactoryAuthPlugin` |
 | `factory/opencode2.mjs` | OpenCode 2.x 适配层，默认导出 `{ id, setup(ctx) }` |
-| `factory/anthropic-tools.mjs` | 工具名别名与 Anthropic schema 包装 |
-| `factory/client-phrases.json` | Factory 拒绝的固定短语与工具名 |
+| `factory/anthropic-tools.mjs` | Anthropic schema 包装与回复解包 |
+| `factory/tool-names.mjs` | 各 wire 的工具名别名、回复还原与流式处理 |
+| `factory/client-phrases.json` | Factory 拒绝的固定文本短语 |
 
 `package.json` 的 `files` 只发布运行需要的文件；测试和 `testdata/` 留在仓库中。包没有运行时依赖，使用 Node 内置 `fetch`、`Headers`、`Response`、`Buffer` 和 `node:http`。
 
@@ -251,7 +252,7 @@ WorkOS 会轮换 refresh token，同一枚 refresh token 不能被花两次。�
    - Messages：`anthropicBody(body)`；
    - Responses/chat：`droidBody(path, body)`；
    - Gemini：URL 阶段已经 `geminiBody()`；
-7. **工具名别名**：`aliasToolNames(dialect, body, REFUSED_TOOL_NAMES)`；
+7. **工具名别名**：`aliasToolNames(body, every)`；遇到新的工具名拒绝时，同一工具集合后续可使用 `every` 全量改名；
 8. **Anthropic schema 包装**：`wrapAnthropicTools()`；
 9. **最后转义**：`sanitizeBody()`；
 10. **发送**：`fetch(url, { ...init, headers, body })`；
@@ -269,7 +270,7 @@ WorkOS 会轮换 refresh token，同一枚 refresh token 不能被花两次。�
 | `User-Agent` | `factory-cli/0.242.0` | 同上 |
 | `X-Factory-Org-Id` | 账号 active org | 无 org 时删除 |
 | `x-api-provider` | 模型的 upstream | 如 anthropic/openai/fireworks |
-| `x-session-id` | 进程级 UUID | 所有请求共享 |
+| `x-session-id` | 会话与 subagent 派生的 UUID | 同一 conversation 稳定，不同 conversation/subagent 隔离 |
 | `x-assistant-message-id` | 每请求 UUID | |
 | `x-provider-routing-source` | `registry_default` | 与 Droid 的默认上游一致 |
 | `OpenAI-Platform` | 固定 org 标识 | 仅 OpenAI upstream |
@@ -304,15 +305,15 @@ You are Droid, an AI software engineering agent built by Factory.
 | Codex GPT-6 | `You are Codex, an agent based on GPT-6.`（句号可省略） | `You are a coding agent based on GPT-6.` |
 | Codex CLI | 两句连写：`You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI.` | `You are a coding agent running in the Codex CLI.` |
 
-只替换固定开头，后续提示原样保留。`droidBody()` 对 Responses 的 `instructions` 还会调用 `promptText()`，确保 DROID_LINE 在最前；对 Codex 0.170 把系统提示放在 `input[0]`、role `developer` 的情况，只调用 `clientOpening()`，不把开发者输入当系统提示整体改写。
+只替换固定开头，后续提示原样保留。`droidBody()` 对 Responses 的 `instructions` 还会调用 `promptText()`，确保 DROID_LINE 在最前；对 Codex 0.170 把系统提示放在 `input[0]`、role `developer` 的情况，调用 `clientOpening()` 和 `guardianRestrictions()`，不把开发者输入当系统提示整体改写。guardian 审查提示中的 `You have no network access.` 改写为 `Network access is unavailable.`，保留只读和权限限制的语义。
 
 ### 9.2 短语分层
 
-`client-phrases.json` 把短语分成三层：
+`client-phrases.json` 把短语分成两层：
 
 - `anywhere`：在任意文本中都可能被拒（pi/omp/Codex 开头、pi compaction 开头）。这些短语在正文里也会被转义。
 - `toolOnly`：只在工具输出里被拒（Claude 身份、环境句、billing header、压缩续写句、全局指令短语）。提示词适配器会改写这些固定元数据，工具输出则用无损编码。
-- `toolNames`：不是短语，而是 Factory 拒绝的工具声明名。见第 11 节。
+- 工具声明名不属于文本短语清单，由 `tool-names.mjs` 单独维护。见第 11 节。
 
 `loadClientPhrases()` 在 JSON 缺失或任一组为空时回退到内置 `FALLBACK_PHRASES`，避免文件损坏导致保护静默消失。
 
@@ -369,12 +370,16 @@ Claude Code 会以多种形状发送同一批元数据：
 `promptText()` 的组合顺序是：
 
 ```js
-configSkillText(
-  clientOpening(
-    systemModelLine(
-      systemContext(
-        claudeIdentity(
-          zcodeRuntimeContext(text)
+harnessText(
+  configSkillText(
+    guardianRestrictions(
+      clientOpening(
+        systemModelLine(
+          claudeIdentity(
+            claudeEnvironment(
+              zcodeRuntimeContext(text)
+            )
+          )
         )
       )
     )
@@ -385,8 +390,10 @@ configSkillText(
 `systemMessageText()` 用于第一个 system block 之后的 system 消息，组合为：
 
 ```js
-bareSkills(clientOpening(systemContext(zcodeRuntimeContext(text))))
+harnessText(bareSkills(guardianRestrictions(clientOpening(systemContext(zcodeRuntimeContext(text))))))
 ```
+
+`harnessText()` 还把客户端提示、工具描述和技能目录中的独立单词 `harness` 改为 `runtime`，但不改用户正文、工具输出或标识符中的该词。
 
 ### 10.3 用户消息与工具结果
 
@@ -432,23 +439,14 @@ Factory 的 Anthropic 路由拒绝根级 `anyOf`、`oneOf`、`allOf`。`wrapAnth
 
 ### 11.2 工具名别名
 
-Factory 会拒绝某些工具声明名（`read`、`bash`、`edit`、`write`、`glob`、`grep`、`web_search`、`task`、`exec_command`、`write_stdin`、`Agent`、`tool_search`、`codex_app` 等）。`aliasToolNames()`：
+Factory 会拒绝某些工具声明名（`read`、`bash`、`edit`、`write`、`glob`、`grep`、`web_search`、`task`、`Agent` 等），清单会变化。`tool-names.mjs` 的 `aliasToolNames()`：
 
 1. 读取请求声明的工具，按声明顺序选择别名；
-2. 优先使用 `PREFERRED_ALIASES` 中已验证可用的名字：
-   - `Agent` → `subagent`
-   - `read` → `read_tool_2`
-   - `bash` → `bash_tool_2`
-   - `edit` → `edit_tool_2`
-   - `write` → `write_tool_2`
-   - `glob` → `glob_tool`
-   - `grep` → `grep_tool`
-   - `web_search` → `web_search_tool`
-   - `codex_app` → `codex_app_tool`
-3. 没有首选名时使用 `<name>_tool`；冲突时加 `_2`、`_3`；
+2. 优先使用 Droid 的对应工具名，例如 `read` → `Read`、`bash` → `Execute`、`write` → `Create`、`Agent` → `Task`；
+3. 没有对应 Droid 名称或名称冲突时，使用进程内稳定的 `<name>_<hash>` 后缀；
 4. 同时改声明、`tool_choice` 和历史调用；
 5. 回复时把别名还原成原名，支持 JSON 和 SSE；
-6. Responses 的 namespace 工具同时处理顶层 `name` 和 `function_call.namespace`。
+6. 遇到清单外名称导致拒绝时，重试一次全量改名，并在进程内记住该工具集合。
 
 没有需要改名的工具时，请求原样返回。别名只存在于 wire 上，agent 看到的始终是原始工具名。
 
@@ -492,7 +490,7 @@ Factory 会拒绝某些工具声明名（`read`、`bash`、`edit`、`write`、`g
 ## 14. 并发与状态
 
 - **无本地持久化**：账号由宿主保存；插件只保存进程内缓存。
-- **进程级 session**：`session = crypto.randomUUID()`，所有请求共享 `x-session-id`；每个请求生成新的 `x-assistant-message-id`。
+- **会话级 session**：`sessionId()` 根据 magpie conversation 和 subagent 派生稳定的 `x-session-id`；没有会话标识时使用进程级 fallback。每个请求生成新的 `x-assistant-message-id`。
 - **刷新锁**：`lock` 串行化 `fresh()`、`mendOrg()`、`auth.refresh()` 和 token 保存。
 - **token 链**：`renewed` 以旧 refresh token 为键，`latest()` 在宿主尚未保存时追上最新 token，避免重复消费。
 - **whoami 节流**：`asked` 按账号记录上次询问时间，失败后 `ASK_AGAIN` 内不再重试。
@@ -519,8 +517,9 @@ Factory 会拒绝某些工具声明名（`read`、`bash`、`edit`、`write`、`g
 ```text
 factory/
 ├── index.mjs                 # 主实现：认证、模型、适配、loader
-├── anthropic-tools.mjs       # 工具名别名、schema 包装、流式解包
-├── client-phrases.json       # 固定短语与工具名
+├── anthropic-tools.mjs       # Anthropic schema 包装与流式解包
+├── tool-names.mjs            # 工具名别名、回复还原与流式处理
+├── client-phrases.json       # 固定文本短语
 ├── opencode.mjs              # OpenCode 1.x / magpie 入口
 ├── opencode2.mjs             # OpenCode 2.x 适配层
 ├── README.md                 # 用户文档
@@ -542,11 +541,11 @@ factory/
 - **413**：保留最新附件、全丢附件、最终错误；
 - **错误翻译**：content policy、组织 403、request id、X-Magpie-Sign-In。
 
-提交 `1e8577eea0` 上的基线：
+当前 0.1.58 合并结果在本仓库根目录验证：
 
 ```sh
-bun test factory
-# 428 pass / 0 fail
+bun test --timeout 15000 ./*.test.mjs
+# 261 pass / 0 fail
 ```
 
 测试不校验真实 Factory 的当前策略；策略变化需要新的回放样本和测试。
@@ -580,10 +579,10 @@ bun test factory
 
 ### 18.4 新增被拒工具名
 
-1. 加入 `client-phrases.json` 的 `toolNames` 和 `FALLBACK_PHRASES.toolNames`；
-2. 如果 `<name>_tool` 也被拒，在 `PREFERRED_ALIASES` 指定可用别名；
+1. 加入 `tool-names.mjs` 的 `REFUSED_TOOL_NAMES`；
+2. 如果有明确的 Droid 对应工具，在 `DROID_NAMES` 指定映射；否则使用稳定后缀；
 3. 在 `tool-names.test.mjs` 增加声明、历史调用、回复还原测试；
-4. 如果有 namespace，确认 `nameSlots.responses` 和 `nameRestorers.responses`。
+4. 覆盖前导下划线、名称冲突和全量改名重试。
 
 ### 18.5 新增客户端元数据
 
