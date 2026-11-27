@@ -6,7 +6,10 @@ import { parseToolJSON } from "./anthropic-tools.mjs"
 // prem.factory.ai. Probed one tool at a time with an empty description: only
 // the declared name decides, matched exactly and case-sensitively. A name
 // that appears only in history (tool_use, function_call), in tool_choice or
-// in text is not refused. The list moves: from 2026-11-17 22:30 PST it held
+// in text is not refused. Responses' namespace declarations follow the same
+// rule: on 2026-11-27 a namespace named codex_app was refused, while the
+// identical tools under a differently named namespace passed. The list moves:
+// from 2026-11-17 22:30 PST it held
 // Claude Code's, OpenCode's and Codex's names; from 2026-11-18 06:00 UTC it
 // also holds the names first used in their place (BashTool, bash_tool, ...)
 // and Claude Code's task tools, and no longer Codex's exec_command,
@@ -23,6 +26,8 @@ export const REFUSED_TOOL_NAMES = new Set([
   // web_search, read_file and execute_command too, and every name above
   // with leading underscores (_read, _web_search), while omp_read passes
   "web_search", "read_file", "execute_command",
+  // measured on 2026-11-27: Codex Desktop's Responses tool namespace.
+  "codex_app",
 ])
 
 // refusedName says whether Factory refuses a tool declared as name: one of
@@ -83,7 +88,7 @@ function declared(request) {
   for (const tool of Array.isArray(request.tools) ? request.tools : []) {
     if (!isObject(tool)) continue
     if (tool.type === "function" && isObject(tool.function)) out.push([tool.function, "name"])
-    else if (typeof tool.name === "string" && (tool.type == null || tool.type === "custom" || tool.type === "function")) out.push([tool, "name"])
+    else if (typeof tool.name === "string" && (tool.type == null || tool.type === "custom" || tool.type === "function" || tool.type === "namespace")) out.push([tool, "name"])
     if (Array.isArray(tool.functionDeclarations)) for (const d of tool.functionDeclarations) if (isObject(d)) out.push([d, "name"])
   }
   return out
@@ -110,7 +115,11 @@ function uses(request) {
     if (Array.isArray(m.tool_calls)) for (const c of m.tool_calls) if (isObject(c?.function)) out.push([c.function, "name"])
   }
   for (const item of Array.isArray(request.input) ? request.input : []) {
-    if (isObject(item) && (item.type === "function_call" || item.type === "custom_tool_call")) out.push([item, "name"])
+    if (isObject(item) && (item.type === "function_call" || item.type === "custom_tool_call")) {
+      out.push([item, "name"])
+      // Codex Desktop names a namespace separately from its child tool.
+      if (typeof item.namespace === "string") out.push([item, "namespace"])
+    }
   }
   for (const c of Array.isArray(request.contents) ? request.contents : []) {
     for (const p of Array.isArray(c?.parts) ? c.parts : []) {
@@ -156,7 +165,15 @@ export function aliasToolNames(body, every = false) {
     }
     holder[key] = renamed.get(name)
   }
-  for (const [holder, key] of uses(request)) if (renamed.has(holder[key])) holder[key] = renamed.get(holder[key])
+  for (const [holder, key] of uses(request)) {
+    if (renamed.has(holder[key])) holder[key] = renamed.get(holder[key])
+    else if (typeof holder[key] === "string") for (const [original, alias] of renamed) {
+      if (holder[key].startsWith(original + ".")) {
+        holder[key] = alias + holder[key].slice(original.length)
+        break
+      }
+    }
+  }
   return { body: JSON.stringify(request), aliases }
 }
 
@@ -185,6 +202,9 @@ function restore(value, aliases) {
     if (!isObject(v)) return
     for (const [k, x] of Object.entries(v)) {
       if (k === "name" && typeof x === "string" && aliases.has(x)) { v[k] = aliases.get(x); changed = true }
+      else if (k === "name" && typeof x === "string") for (const [alias, original] of aliases) {
+        if (x.startsWith(alias + ".")) { v[k] = original + x.slice(alias.length); changed = true; break }
+      }
       else if (!ARGUMENTS.has(k)) walk(x)
     }
   }

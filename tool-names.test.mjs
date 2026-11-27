@@ -18,6 +18,7 @@ const SEEN_REFUSED = new Set([
   "agent", "bash", "edit", "glob", "grep", "read", "run_shell", "task", "write",
   "AgentTool", "BashTool", "WriteTool", "bash_tool", "edit_tool", "read_tool", "write_tool",
   "web_search", "read_file", "execute_command",
+  "codex_app",
 ])
 const seenRefused = (n) => typeof n === "string" && (SEEN_REFUSED.has(n) || SEEN_REFUSED.has(n.replace(/^_+/, "")))
 
@@ -26,6 +27,10 @@ function refusing(names) {
   return names.some((n) => seenRefused(n))
     ? Response.json({ code: "content_policy_rejected", detail: "This request was blocked by Factory's usage policy check." }, { status: 403 })
     : null
+}
+
+function refusingWireTools(tools) {
+  return refusing(tools.flatMap((tool) => tool.type === "namespace" ? [tool.name] : [tool.function?.name ?? tool.name]))
 }
 
 async function loaded(serve) {
@@ -128,6 +133,27 @@ test("OpenAI Responses: OpenCode's bash and its earlier call go out as Execute, 
   expect(sent.input[0].name).toBe("Execute")
   const got = (await res.text()).split("\n").filter((x) => x.startsWith("data: ")).map((x) => JSON.parse(x.slice(6)))
   expect(got.map((e) => e.item.name)).toEqual(["bash", "bash"])
+})
+
+test("Responses: a refused namespace is renamed, its children and their restored calls keep the caller's names", async () => {
+  const alias = suffixed("codex_app")
+  const { l, seen } = await loaded((sent) => refusingWireTools(sent.tools) ?? sse([
+    { type: "response.output_item.done", output_index: 0, item: { type: "function_call", id: "fc1", call_id: "c1", name: `${alias}.read_thread_terminal`, arguments: "{}" } },
+  ]))
+  const namespace = { type: "namespace", name: "codex_app", tools: [{ type: "function", name: "read_thread_terminal", parameters: schema }] }
+  const res = await l.fetch(R, { method: "POST", body: JSON.stringify({
+    model: "gpt-6.1-sol", stream: true, tools: [namespace, { type: "function", name: "exec_command", parameters: schema }],
+    input: [
+      { type: "function_call", call_id: "c0", name: "codex_app.read_thread_terminal", arguments: "{}" },
+      { type: "function_call", call_id: "c1", name: "list_attachments", namespace: "codex_app", arguments: "{}" },
+    ],
+  }) })
+  const sent = JSON.parse(seen[0].body)
+  expect(sent.tools[0]).toEqual({ ...namespace, name: alias })
+  expect(sent.input[0].name).toBe(`${alias}.read_thread_terminal`)
+  expect(sent.input[1]).toEqual({ type: "function_call", call_id: "c1", name: "list_attachments", namespace: alias, arguments: "{}" })
+  const got = (await res.text()).split("\n").filter((x) => x.startsWith("data: ")).map((x) => JSON.parse(x.slice(6)))
+  expect(got[0].item.name).toBe("codex_app.read_thread_terminal")
 })
 
 test("chat completions: a refused function name and its history are renamed and the reply restored", async () => {

@@ -189,7 +189,10 @@ declares such a tool under droid's own name for the job (`Execute` for `Bash`, `
 request already declares it, under its own name with a suffix drawn from the
 process (`TaskCreate_3f9a`). It renames the tool's earlier calls and
 `tool_choice` to match and gives the caller its own name back in every reply,
-streamed or not. The lists are in `tool-names.mjs`.
+streamed or not. Responses tool namespaces follow the same rule: Factory
+refuses Codex Desktop's `codex_app`, which goes out under a suffixed alias
+while the names of its child tools stay unchanged. The lists are in
+`tool-names.mjs`.
 
 Factory adds names without notice. A request refused while it declares tools
 goes once more with every tool renamed the same way (droid's own names and
